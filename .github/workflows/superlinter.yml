@@ -1,0 +1,266 @@
+from multiprocessing import pool
+from pathlib import Path
+from numpy import poly
+import pandas as pd
+from PIL import Image, ImageDraw, ImageFont
+import requests
+import json
+from typing import List, Tuple
+import click
+from shapely.geometry import Polygon, Point
+
+
+def open_image(image_path):
+    if str(image_path).startswith("http"):
+        image_url = str(image_path)
+        if "://" not in image_url:
+            image_url = str(image_path).replace(":/", "://")
+        res = requests.get(image_url, stream=True)
+        if res.status_code == 200:
+            image_data = res.raw
+            return Image.open(image_data)
+        else:
+            print("Image not found: " + image_url)
+    else:
+        return Image.open(image_path)
+
+
+def check_overlap(
+    rect: List[float], point: List[float], polygon: List[List[float]]
+) -> Tuple[bool, bool, float]:
+    """
+    Check if a patch and a polygon overlap
+    """
+    overlap_ratio = 0
+    polygon_shp = Polygon(polygon)
+    rect_shp = Polygon(
+        [  #  top left botton right
+            # 0   1    2      3
+            (rect[0][0], rect[0][1]),
+            (rect[0][0], rect[1][1]),
+            (rect[1][0], rect[1][1]),
+            (rect[1][0], rect[0][1]),
+        ]
+    )
+    point_shp = Point(point)
+    polygon_in_rect = polygon_shp.intersects(rect_shp)
+    if polygon_in_rect:
+        area = polygon_shp.intersection(rect_shp).area
+        polygon_area = polygon_shp.area
+        overlap_ratio = area / polygon_area
+
+    point_in_rect = point_shp.within(rect_shp)
+    return point_in_rect, polygon_in_rect, overlap_ratio
+
+
+def unitary2px(point, rows, cols):
+    return (point[0] * rows, point[1] * cols)
+
+
+def process_annotation(
+    annotation_subset: pd.DataFrame,
+    patch_location: List[float],
+    image_fn: str,
+    grid_x: int,
+    grid_y: int,
+    min_ratio: float,
+    show_image: bool,
+) -> Tuple[bool, str]:
+    patch_location = json.loads(patch_location)
+    top, bottom, left, right = patch_location
+    unitary_rect = [(left, top), (right, bottom)]
+    unitary_polygon = []
+    found_overlap = False
+    found_class = None
+    found_annotations = []
+    all_annotations = []
+    num_annotations = len(annotation_subset)
+
+    for idx in range(num_annotations):
+        annotation = annotation_subset.iloc[idx]
+        p_data = str(annotation["point_data"])
+        p_x = float(annotation["x"])
+        p_y = float(annotation["y"])
+        unitary_point = [p_x, p_y]
+        p_class = annotation["class_name"]
+        annotation_dict = {
+            "class": p_class,
+            "point": unitary_point,
+        }
+        unitary_polygon = []
+        if "user_created" in p_data:
+            annotation_dict["data_type"] = "Point label"
+        elif "x" in annotation and "y" in annotation:
+            annotation_dict["data_type"] = "Grid label"
+            # Use grid_x and grid_y to create a polygon and check overlap
+            x_size = 0.5 / (grid_x)
+            y_size = 0.5 / (grid_y)
+            unitary_polygon = [
+                [p_x - x_size, p_y - y_size],
+                [p_x - x_size, p_y + y_size],
+                [p_x + x_size, p_y + y_size],
+                [p_x + x_size, p_y - y_size],
+            ]
+        if "polygon" in p_data:
+            pd_dict = json.loads(annotation["point_data"])
+            poly = pd_dict["polygon"]
+            unitary_polygon = [[float(p[0]) + p_x, float(p[1]) + p_y] for p in poly]
+            annotation_dict["data_type"] = "Polygon label"
+            annotation_dict["polygon"] = unitary_polygon
+        # Check if patch and annotation overlap
+        point_in_rect, polygon_in_rect, overlap_ratio = check_overlap(
+            unitary_rect, unitary_point, unitary_polygon
+        )
+
+        annotation_dict["overlap_ratio"] = overlap_ratio
+        if point_in_rect and not polygon_in_rect:
+            annotation_dict["overlap_ratio"] = (
+                min_ratio,  # Give point the min_ratio to be considered
+            )
+        all_annotations.append(annotation_dict)
+
+        if point_in_rect and not polygon_in_rect:
+            found_annotations.append(annotation_dict)
+            found_overlap = True
+        elif polygon_in_rect and overlap_ratio >= min_ratio:
+            found_annotations.append(annotation_dict)
+            found_overlap = True
+
+        found_overlap = found_overlap or point_in_rect or polygon_in_rect
+
+    # image_name = Path(image_fn).name
+    # print(data_type, "class", p_class, "at", int(p_x), int(p_y), "in", image_name)
+    # If more than one annotation has been found in the patch, apply the strategy
+    # winner takes all
+    if len(found_annotations) > 1:
+        # Sort by overlap ratio
+        found_annotations = sorted(
+            found_annotations, key=lambda k: k["overlap_ratio"], reverse=True
+        )
+        # print(found_annotations)
+        annotation = found_annotations[0]
+        # print("Winner:", annotation["data_type"], annotation["class"])
+        found_class = annotation["class"]
+    elif len(found_annotations) == 1:
+        found_class = found_annotations[0]["class"]
+
+    if show_image:
+        img = open_image(image_fn)
+        # make a blank image for the text, initialized to transparent text color
+        fnt = ImageFont.truetype("Pillow/Tests/fonts/FreeMono.ttf", 40)
+        draw = ImageDraw.Draw(img)
+        rows, cols = img.size
+        rect = [
+            unitary_rect[0][0] * rows,
+            unitary_rect[0][1] * cols,
+            unitary_rect[1][0] * rows,
+            unitary_rect[1][1] * cols,
+        ]
+        draw.rectangle(rect, outline="red", width=3)
+
+        for annotation in all_annotations:
+            if not "polygon" in annotation:
+                point = unitary2px(annotation["point"], rows, cols)
+                shape = [(point[0] - 10, point[1] - 10), (point[0] + 10, point[1] + 10)]
+                draw.ellipse(shape, fill="#ffffff", outline="blue", width=3)
+                draw.text(
+                    (point[0], point[1] - 5),
+                    annotation["class"],
+                    font=fnt,
+                    fill=(0, 0, 255),
+                    stroke_width=1,
+                    anchor="md",
+                )
+            elif "polygon" in annotation:
+                polygon = annotation["polygon"]
+                point = unitary2px(annotation["point"], rows, cols)
+                lines = ()
+                for line in polygon:
+                    x, y = line
+                    lines += ((x * rows, y * cols),)
+                lines += lines[0]
+                draw.line(lines, width=3, fill="green")
+
+                # Find minimum point in the polygon
+                min_x = min(polygon, key=lambda x: x[0])[0] * rows
+                min_y = min(polygon, key=lambda x: x[1])[1] * cols
+                draw.text(
+                    (min_x, min_y - 5),
+                    annotation["class"],
+                    font=fnt,
+                    fill=(0, 255, 0),
+                    stroke_width=1,
+                    # anchor="md",
+                )
+        if found_class is not None:
+            draw.text(
+                (left * cols, top * rows - 40),
+                found_class,
+                font=fnt,
+                fill=(255, 0, 0),
+                stroke_width=1,
+            )
+        img.show()
+    return found_overlap, found_class
+
+
+@click.command()
+@click.option("--force", "-F", default=False, help="Overwrite results", is_flag=True)
+@click.option(
+    "--debug", default=False, help="Debug process showing images", is_flag=True
+)
+@click.option("--grid-x", default=0, help="Number of grid elements in the X direction")
+@click.option("--grid-y", default=0, help="Number of grid elements in the y direction")
+@click.option("--min-ratio", default=0.1, help="Minimum ratio of overlap")
+@click.argument("sampled_images_csv", type=click.Path(exists=True))
+@click.argument("squidle_annotation_csv", type=click.Path(exists=True))
+def cli(
+    sampled_images_csv, squidle_annotation_csv, grid_x, grid_y, min_ratio, debug, force
+):
+
+    annotations_df = pd.read_csv(squidle_annotation_csv)
+    dataset_df = pd.read_csv(sampled_images_csv)
+
+    patch_locations = dataset_df["patch_location"].tolist()
+    original_images = dataset_df["original_image"].tolist()
+    media_paths = dataset_df["media_path"].tolist()
+
+    if "ground_truth" in dataset_df.columns and not force:
+        print("Ground truth already present. Use -F to overwrite.")
+        return
+
+    ground_truth_classes = []
+    dataset_df["ground_truth"] = ""
+
+    for idx, (patch_location, image_fn, media_path) in enumerate(
+        zip(patch_locations, original_images, media_paths)
+    ):
+        # img = open_image("lga_output/" + media_path)
+        # img.show()
+
+        class_name = ""
+        annotation_subset = annotations_df[
+            annotations_df["media_path"].str.contains(image_fn)
+        ]
+        if not annotation_subset.empty:
+            found, class_name = process_annotation(
+                annotation_subset,
+                patch_location,
+                image_fn,
+                grid_x,
+                grid_y,
+                min_ratio,
+                show_image=debug,
+            )
+            if found:
+                print("Found", class_name, "annotations for", Path(image_fn).name)
+        ground_truth_classes.append(class_name)
+
+    print("Saving results to sampled_images CSV")
+    dataset_df["ground_truth"] = ground_truth_classes
+    dataset_df.to_csv(sampled_images_csv, index=False)
+    print("Finished")
+
+
+if __name__ == "__main__":
+    cli()
